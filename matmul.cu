@@ -66,38 +66,38 @@ static __global__ void matmul_kernel(float *A, float *B, float *C, int M, int N,
 }
 
 #define NGPU 4
-
 static size_t Mbegin[NGPU], Mend[NGPU];
-static size_t ngpu;
 static cudaStream_t streams[NGPU];
+
 static float *A_gpu[NGPU], *B_gpu[NGPU], *C_gpu[NGPU];
 
 static int mpi_rank, mpi_world_size;
 int node_M;
 
+#define SLICE 4
+MPI_Request reqA[SLICE], reqB, req[50], gar[10];
+int reqNum;
 
 void matmul_initialize(int M, int N, int K) 
 {
   MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
   MPI_Comm_size(MPI_COMM_WORLD, &mpi_world_size);
-  node_M = M / mpi_world_size;
+  node_M = M / SLICE / mpi_world_size;
 
-  ngpu = 4;
-
-  for (size_t i = 0; i < ngpu; i++)
+  for (size_t i = 0; i < NGPU; i++)
   {
-    Mbegin[i] = node_M / ngpu * i;
-    Mend[i] = node_M / ngpu * (i + 1);
-    if (i == ngpu - 1) Mend[i] = node_M;
+    Mbegin[i] = node_M / NGPU * i;
+    Mend[i] = node_M / NGPU * (i + 1);
+    if (i == NGPU - 1) Mend[i] = node_M;
   }
 
-  for (size_t i = 0; i < ngpu; i++)
+  for (size_t i = 0; i < NGPU; i++)
   {
     CHECK_CUDA(cudaSetDevice(i));
     CHECK_CUDA(cudaStreamCreate(&streams[i]));
   }
 
-  for (size_t i =0; i < ngpu; i++)
+  for (size_t i =0; i < NGPU; i++)
   {
     CHECK_CUDA(cudaSetDevice(i));
     CHECK_CUDA(cudaMalloc(&A_gpu[i], (Mend[i] - Mbegin[i]) * K * sizeof(float)));
@@ -107,46 +107,20 @@ void matmul_initialize(int M, int N, int K)
 
 }
 
-
-void matmul(const float *A, const float *B, float *C, int M, int N, int K) 
+void matmul_slice(float *A, float *C, int M, int N, int K, int buf)
 {
-  MPI_Request req1, req2, req[mpi_world_size - 1];
-
-  if(mpi_rank ==0)
+  if (mpi_rank != 0)
   {
-    for (int i = 1; i < mpi_world_size; ++i)
-    {
-      MPI_Isend(&A[i * node_M * K], node_M * K, MPI_FLOAT, i, 0, MPI_COMM_WORLD, &req[i - 1]);
-      MPI_Isend(B, K * N, MPI_FLOAT, i, 0, MPI_COMM_WORLD, &req[i - 1]);
-    }
-  } else {
-    MPI_Irecv((float *)A, node_M * K, MPI_FLOAT, 0, 0, MPI_COMM_WORLD, &req1);
-    MPI_Irecv((float *)B, K * N, MPI_FLOAT, 0, 0, MPI_COMM_WORLD, &req2);
+    MPI_Wait(&reqA[buf], MPI_STATUS_IGNORE);
   }
 
-
-  if(mpi_rank != 0)
-  {
-    MPI_Wait(&req1, MPI_STATUS_IGNORE);
-  }
-
-  for (size_t i =0; i < ngpu; i++)
+  for (int i = 0; i < NGPU; i++)
   {
     CHECK_CUDA(cudaSetDevice(i));
-    CHECK_CUDA(cudaMemcpyAsync(A_gpu[i], &A[Mbegin[i] * K], (Mend[i] - Mbegin[i]) * K * sizeof(float), cudaMemcpyHostToDevice, streams[i]));
+    CHECK_CUDA(cudaMemcpyAsync(A_gpu[i], &A[Mbegin[i] * K], (Mend[i] - Mbegin[i]) * K * sizeof(float), cudaMemcpyHostToDevice, streams[i]));    
   }
 
-  if(mpi_rank != 0)
-  {
-    MPI_Wait(&req2, MPI_STATUS_IGNORE);
-  }  
-  for (size_t i =0; i < ngpu; i++)
-  {
-    CHECK_CUDA(cudaSetDevice(i));
-    CHECK_CUDA(cudaMemcpyAsync(B_gpu[i], B, K * N * sizeof(float), cudaMemcpyHostToDevice, streams[i]));
-  }
-
-  for (size_t i =0; i < ngpu; i++)
+  for (int i = 0; i < NGPU; i++)
   {
     CHECK_CUDA(cudaSetDevice(i));
     dim3 blockDim(TS / WPT, TS);
@@ -155,34 +129,95 @@ void matmul(const float *A, const float *B, float *C, int M, int N, int K)
     CHECK_CUDA(cudaGetLastError());
   }
 
-  for(size_t i =0; i < ngpu; i++)
+  for(size_t i =0; i < NGPU; i++)
   {
     CHECK_CUDA(cudaSetDevice(i));
     CHECK_CUDA(cudaMemcpyAsync(&C[Mbegin[i] * N], C_gpu[i], (Mend[i] - Mbegin[i]) * N * sizeof(float), cudaMemcpyDeviceToHost, streams[i]));
   }
 
-  for (size_t i =0; i < ngpu; i++)
+  for (size_t i =0; i < NGPU; i++)
   {
     CHECK_CUDA(cudaSetDevice(i));
     CHECK_CUDA(cudaStreamSynchronize(streams[i]));
   }
 
-  if (mpi_rank == 0) 
+  //MPI gather C
+  if(mpi_rank == 0)
   {
     for (int i = 1; i < mpi_world_size; i++)
     {
-      MPI_Irecv(&C[i * node_M * N], node_M * N, MPI_FLOAT, i, 0, MPI_COMM_WORLD, &req[i - 1]);
-    }
-    MPI_Waitall(mpi_world_size - 1, req, MPI_STATUS_IGNORE);
+      MPI_Irecv(&C[i * node_M * N], node_M * N, MPI_FLOAT, i, 0, MPI_COMM_WORLD, &req[reqNum]);
+      MPI_Request_free(&req[reqNum]);
+      reqNum += 1;
+    } 
   } else {
-    MPI_Isend(C, node_M * N, MPI_FLOAT, 0, 0, MPI_COMM_WORLD, &req1);
+    MPI_Isend(C, node_M * N, MPI_FLOAT, 0, 0, MPI_COMM_WORLD, &gar[0]);
+    MPI_Request_free(&gar[0]);
   }
 }
 
+void matmul(const float *A, const float *B, float *C, int M, int N, int K) 
+{
+  reqNum = 0;
+
+  // SEND B
+  if(mpi_rank == 0)
+  {
+    for (int i = 1; i < mpi_world_size; i++)
+    {
+      MPI_Isend(B, K * N, MPI_FLOAT, i, 0, MPI_COMM_WORLD, &gar[i - 1]);
+      MPI_Request_free(&gar[i - 1]);
+
+    }
+  } else
+  {
+    MPI_Irecv((float *)B, K * N, MPI_FLOAT, 0, 0, MPI_COMM_WORLD, &reqB);
+  }
+
+  // SEND A
+  for (int buf = 0; buf < SLICE; buf++)
+  {
+    int offset = buf * M / SLICE;
+
+    if (mpi_rank == 0)
+    {
+      for (int i = 1; i < mpi_world_size; i++)
+      {
+        MPI_Isend(&A[offset * K + i * node_M * K], node_M * K, MPI_FLOAT, i, 0, MPI_COMM_WORLD, &gar[i-1]);
+        MPI_Request_free(&gar[i-1]);
+
+      }
+    } else
+    {
+      MPI_Irecv((float *)&A[offset * K], node_M * K, MPI_FLOAT, 0, 0, MPI_COMM_WORLD, &reqA[buf]);
+    }
+  }
+
+    // node B to gpu_B
+  if (mpi_rank != 0)
+  {
+    MPI_Wait(&reqB, MPI_STATUS_IGNORE);
+  }
+
+  for (int i = 0; i < NGPU; i++)
+  {
+    CHECK_CUDA(cudaSetDevice(i));
+    CHECK_CUDA(cudaMemcpyAsync(B_gpu[i], B, K * N * sizeof(float), cudaMemcpyHostToDevice, streams[i]));
+  }
+
+  for (int buf =0; buf < SLICE; buf++)
+  {
+    int offset = buf * M / SLICE;
+    matmul_slice((float *)&A[offset * K], &C[offset * N], M / SLICE, N, K, buf);
+  }
+
+  //MPI_Waitall(reqNum, req, MPI_STATUS_IGNORE);
+
+}
 
 void matmul_finalize() 
 {
-  for(size_t i = 0; i < ngpu; i++)
+  for(size_t i = 0; i < NGPU; i++)
   {
     CHECK_CUDA(cudaSetDevice(i));
     CHECK_CUDA(cudaFree(A_gpu[i]));
