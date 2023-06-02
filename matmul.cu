@@ -22,13 +22,13 @@
 
 static __global__ void matmul_kernel(float *A, float *B, float *C, int M, int N, int K)
 {  
-  int globalRow = blockDim.y * blockIdx.y + threadIdx.y;
-  int globalCol = WPT * blockDim.x * blockIdx.x + threadIdx.x;
-  int row = threadIdx.y;
-  int col = threadIdx.x;
+  int A_globalRow = blockDim.y * blockIdx.y + threadIdx.y;
+  int B_globalCol = WPT * blockDim.x * blockIdx.x + threadIdx.x;
+  int localRow = threadIdx.y;
+  int localCol = threadIdx.x;
 
-  __shared__ float Asub[TS][TS];
-  __shared__ float Bsub[TS][TS];
+  __shared__ float Alocal[TS][TS];
+  __shared__ float Blocal[TS][TS];
 
   float acc[WPT];
   for (int i =0; i < WPT; i++)
@@ -36,15 +36,15 @@ static __global__ void matmul_kernel(float *A, float *B, float *C, int M, int N,
     acc[i] = 0.0;
   }
 
-  for (int offset =0; offset < K; offset += TS)
+  for (int bk =0; bk < K; bk += TS)
   {
-    int tiledRow = offset + row;
-    int tiledCol = offset + col;
+    int A_globalCol = bk + localCol;
+    int B_globalRow = bk + localRow;
 
     for (int i=0; i < WPT; i++)
     {
-      Asub[row][col + i * RTS] = A[globalRow * K + (tiledCol + i * RTS)];
-      Bsub[row][col + i * RTS] = B[tiledRow * N + (globalCol + i * RTS)];
+      Alocal[localRow][localCol + i * RTS] = A[A_globalRow * K + (A_globalCol + i * RTS)];
+      Blocal[localRow][localCol + i * RTS] = B[B_globalRow * N + (B_globalCol + i * RTS)];
     }
 
     __syncthreads();
@@ -53,14 +53,14 @@ static __global__ void matmul_kernel(float *A, float *B, float *C, int M, int N,
     {
       for (int i =0; i < WPT; i++)
       {
-        acc[i] += Asub[row][k] * Bsub[k][col + i * RTS];
+        acc[i] += Alocal[localRow][k] * Blocal[k][localCol + i * RTS];
       }
     }
     __syncthreads();
   }
   for (int i =0; i < WPT; i++)
   {
-    C[globalRow * N + (globalCol + i * RTS)] = acc[i];
+    C[A_globalRow * N + (B_globalCol + i * RTS)] = acc[i];
   }
   
 }
@@ -146,9 +146,7 @@ void matmul_slice(float *A, float *C, int M, int N, int K, int buf)
   {
     for (int i = 1; i < mpi_world_size; i++)
     {
-      MPI_Irecv(&C[i * node_M * N], node_M * N, MPI_FLOAT, i, 0, MPI_COMM_WORLD, &req[reqNum]);
-      MPI_Request_free(&req[reqNum]);
-      reqNum += 1;
+      MPI_Irecv(&C[i * node_M * N], node_M * N, MPI_FLOAT, i, 0, MPI_COMM_WORLD, &req[reqNum++]);
     } 
   } else {
     MPI_Isend(C, node_M * N, MPI_FLOAT, 0, 0, MPI_COMM_WORLD, &gar[0]);
@@ -211,7 +209,7 @@ void matmul(const float *A, const float *B, float *C, int M, int N, int K)
     matmul_slice((float *)&A[offset * K], &C[offset * N], M / SLICE, N, K, buf);
   }
 
-  //MPI_Waitall(reqNum, req, MPI_STATUS_IGNORE);
+  MPI_Waitall(reqNum, req, MPI_STATUS_IGNORE);
 
 }
 
