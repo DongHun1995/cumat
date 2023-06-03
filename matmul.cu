@@ -15,53 +15,59 @@
     }                                                                    \
   } while (0)
 
-#define TS 64
-#define WPT 4
-#define RTS TS / WPT
+#define TS 32
+#define WIDTH 4
 
-
-static __global__ void matmul_kernel(float *A, float *B, float *C, int M, int N, int K)
+static __global__ void matmul_kernel(float4 *A, float4 *B, float4 *C, int M, int N, int K)
 {  
   int A_globalRow = blockDim.y * blockIdx.y + threadIdx.y;
-  int B_globalCol = WPT * blockDim.x * blockIdx.x + threadIdx.x;
+  int B_globalCol = blockDim.x * blockIdx.x + threadIdx.x;
   int localRow = threadIdx.y;
   int localCol = threadIdx.x;
 
-  __shared__ float Alocal[TS][TS];
-  __shared__ float Blocal[TS][TS];
+  __shared__ float4 Alocal[TS][TS/WIDTH];
+  __shared__ float4 Blocal[TS][TS/WIDTH];
 
-  float acc[WPT];
-  for (int i =0; i < WPT; i++)
-  {
-    acc[i] = 0.0;
-  }
-
+  float4 inter_val = { 0.0f, 0.0f, 0.0f, 0.0f};
+  
   for (int bk =0; bk < K; bk += TS)
   {
-    int A_globalCol = bk + localCol;
+    int A_globalCol = (bk/WIDTH) + localCol;
     int B_globalRow = bk + localRow;
 
-    for (int i=0; i < WPT; i++)
-    {
-      Alocal[localRow][localCol + i * RTS] = A[A_globalRow * K + (A_globalCol + i * RTS)];
-      Blocal[localRow][localCol + i * RTS] = B[B_globalRow * N + (B_globalCol + i * RTS)];
-    }
-
+    Alocal[localRow][localCol] = A[A_globalRow * (K / WIDTH) + A_globalCol];
+    Blocal[localRow][localCol] = B[B_globalRow * (N / WIDTH) + B_globalCol];
+    
     __syncthreads();
 
-    for (int k=0; k < TS; ++k)
+    float4 vecA, vecB;
+    float valA;
+    for (int k =0; k < TS/WIDTH; k++)
     {
-      for (int i =0; i < WPT; i++)
+      vecA = Alocal[localRow][k];
+      for (int w =0; w < WIDTH; w++)
       {
-        acc[i] += Alocal[localRow][k] * Blocal[k][localCol + i * RTS];
+        vecB = Blocal[WIDTH*k + w][localCol];
+
+        switch(w)
+        {
+          case 0: valA = vecA.x; break;
+          case 1: valA = vecA.y; break;
+          case 2: valA = vecA.z; break;
+          case 3: valA = vecA.w; break;
+        }
+
+        inter_val.x += vecB.x * valA;
+        inter_val.y += vecB.y * valA;
+        inter_val.z += vecB.z * valA;
+        inter_val.w += vecB.w * valA;
       }
     }
+
     __syncthreads();
   }
-  for (int i =0; i < WPT; i++)
-  {
-    C[A_globalRow * N + (B_globalCol + i * RTS)] = acc[i];
-  }
+  
+    C[A_globalRow * (N / WIDTH) + B_globalCol] = inter_val;
   
 }
 
@@ -123,9 +129,9 @@ void matmul_slice(float *A, float *C, int M, int N, int K, int buf)
   for (int i = 0; i < NGPU; i++)
   {
     CHECK_CUDA(cudaSetDevice(i));
-    dim3 blockDim(TS / WPT, TS);
+    dim3 blockDim(TS / WIDTH, TS);
     dim3 gridDim((N + TS - 1) / TS, (Mend[i] - Mbegin[i] + TS - 1) / TS);
-    matmul_kernel<<<gridDim, blockDim, 0, streams[i]>>>(A_gpu[i], B_gpu[i], C_gpu[i], Mend[i] - Mbegin[i], N, K);
+    matmul_kernel<<<gridDim, blockDim, 0, streams[i]>>>(reinterpret_cast<float4*>(A_gpu[i]), reinterpret_cast<float4*>(B_gpu[i]), reinterpret_cast<float4*>(C_gpu[i]), Mend[i] - Mbegin[i], N, K);
     CHECK_CUDA(cudaGetLastError());
   }
 
