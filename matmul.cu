@@ -1,4 +1,3 @@
-#include <cstdio>
 #include "matmul.h"
 #include "util.h"
 
@@ -6,227 +5,183 @@
 #include <mpi.h>
 
 #define CHECK_CUDA(call)                                                 \
-  do {                                                                   \
+  do                                                                     \
+  {                                                                      \
     cudaError_t status_ = call;                                          \
-    if (status_ != cudaSuccess) {                                        \
+    if (status_ != cudaSuccess)                                          \
+    {                                                                    \
       fprintf(stderr, "CUDA error (%s:%d): %s:%s\n", __FILE__, __LINE__, \
               cudaGetErrorName(status_), cudaGetErrorString(status_));   \
       exit(EXIT_FAILURE);                                                \
     }                                                                    \
   } while (0)
 
-#define TS 32
-#define WIDTH 4
-
-static __global__ void matmul_kernel(float4 *A, float4 *B, float4 *C, int M, int N, int K)
-{  
-  int A_globalRow = blockDim.y * blockIdx.y + threadIdx.y;
-  int B_globalCol = blockDim.x * blockIdx.x + threadIdx.x;
-  int localRow = threadIdx.y;
-  int localCol = threadIdx.x;
-
-  __shared__ float4 Alocal[TS][TS/WIDTH];
-  __shared__ float4 Blocal[TS][TS/WIDTH];
-
-  float4 inter_val = { 0.0f, 0.0f, 0.0f, 0.0f};
-  
-  for (int bk =0; bk < K; bk += TS)
-  {
-    int A_globalCol = (bk/WIDTH) + localCol;
-    int B_globalRow = bk + localRow;
-
-    Alocal[localRow][localCol] = A[A_globalRow * (K / WIDTH) + A_globalCol];
-    Blocal[localRow][localCol] = B[B_globalRow * (N / WIDTH) + B_globalCol];
-    
-    __syncthreads();
-
-    float4 vecA, vecB;
-    float valA;
-    for (int k =0; k < TS/WIDTH; k++)
-    {
-      vecA = Alocal[localRow][k];
-      for (int w =0; w < WIDTH; w++)
-      {
-        vecB = Blocal[WIDTH*k + w][localCol];
-
-        switch(w)
-        {
-          case 0: valA = vecA.x; break;
-          case 1: valA = vecA.y; break;
-          case 2: valA = vecA.z; break;
-          case 3: valA = vecA.w; break;
-        }
-
-        inter_val.x += vecB.x * valA;
-        inter_val.y += vecB.y * valA;
-        inter_val.z += vecB.z * valA;
-        inter_val.w += vecB.w * valA;
-      }
-    }
-
-    __syncthreads();
-  }
-  
-    C[A_globalRow * (N / WIDTH) + B_globalCol] = inter_val;
-  
-}
-
+//하이퍼 파라미터 설정
+#define TS 64
+#define WORK 4
+#define WTS TS / WORK
 #define NGPU 4
-static size_t Mbegin[NGPU], Mend[NGPU];
-static cudaStream_t streams[NGPU];
+#define SLICE 8
 
-static float *A_gpu[NGPU], *B_gpu[NGPU], *C_gpu[NGPU];
-
-static int mpi_rank, mpi_world_size;
-int node_M;
-
-#define SLICE 4
-MPI_Request reqA[SLICE], reqB, req[50], gar[10];
-int reqNum;
-
-void matmul_initialize(int M, int N, int K) 
+__global__ void matmul_kernel(float4 *A, float4 *B, float4 *C, int M, int N, int K)
 {
-  MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
-  MPI_Comm_size(MPI_COMM_WORLD, &mpi_world_size);
-  node_M = M / SLICE / mpi_world_size;
+  int B_globalCol = WORK * blockDim.x * blockIdx.x + WORK * threadIdx.x;
+  int A_globalRow = WORK * blockDim.y * blockIdx.y + threadIdx.y;
+  int localCol = WORK * threadIdx.x;
+  int localRow = threadIdx.y;
 
-  for (size_t i = 0; i < NGPU; i++)
+  // 쉐어드 메모리 올리기
+  __shared__ float4 Alocal[TS][TS / WORK];
+  __shared__ float4 Blocal[TS][TS / WORK];
+  //백터 더하는 배열 선언
+  float4 acc[WORK];
+  for (int i = 0; i < WORK; i++)
   {
-    Mbegin[i] = node_M / NGPU * i;
-    Mend[i] = node_M / NGPU * (i + 1);
-    if (i == NGPU - 1) Mend[i] = node_M;
+    acc[i] = {0.0f, 0.0f, 0.0f, 0.0f};
   }
-
-  for (size_t i = 0; i < NGPU; i++)
+  // 타일링 Row, col 선언
+  for (int toff = 0; toff < K; toff += TS)
   {
-    CHECK_CUDA(cudaSetDevice(i));
-    CHECK_CUDA(cudaStreamCreate(&streams[i]));
-  }
-
-  for (size_t i =0; i < NGPU; i++)
-  {
-    CHECK_CUDA(cudaSetDevice(i));
-    CHECK_CUDA(cudaMalloc(&A_gpu[i], (Mend[i] - Mbegin[i]) * K * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&B_gpu[i], K * N * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&C_gpu[i], (Mend[i] - Mbegin[i]) * N * sizeof(float)));
-  }
-
-}
-
-void matmul_slice(float *A, float *C, int M, int N, int K, int buf)
-{
-  if (mpi_rank != 0)
-  {
-    MPI_Wait(&reqA[buf], MPI_STATUS_IGNORE);
-  }
-
-  for (int i = 0; i < NGPU; i++)
-  {
-    CHECK_CUDA(cudaSetDevice(i));
-    CHECK_CUDA(cudaMemcpyAsync(A_gpu[i], &A[Mbegin[i] * K], (Mend[i] - Mbegin[i]) * K * sizeof(float), cudaMemcpyHostToDevice, streams[i]));    
-  }
-
-  for (int i = 0; i < NGPU; i++)
-  {
-    CHECK_CUDA(cudaSetDevice(i));
-    dim3 blockDim(TS / WIDTH, TS);
-    dim3 gridDim((N + TS - 1) / TS, (Mend[i] - Mbegin[i] + TS - 1) / TS);
-    matmul_kernel<<<gridDim, blockDim, 0, streams[i]>>>(reinterpret_cast<float4*>(A_gpu[i]), reinterpret_cast<float4*>(B_gpu[i]), reinterpret_cast<float4*>(C_gpu[i]), Mend[i] - Mbegin[i], N, K);
-    CHECK_CUDA(cudaGetLastError());
-  }
-
-  for(size_t i =0; i < NGPU; i++)
-  {
-    CHECK_CUDA(cudaSetDevice(i));
-    CHECK_CUDA(cudaMemcpyAsync(&C[Mbegin[i] * N], C_gpu[i], (Mend[i] - Mbegin[i]) * N * sizeof(float), cudaMemcpyDeviceToHost, streams[i]));
-  }
-
-  for (size_t i =0; i < NGPU; i++)
-  {
-    CHECK_CUDA(cudaSetDevice(i));
-    CHECK_CUDA(cudaStreamSynchronize(streams[i]));
-  }
-
-  //MPI gather C
-  if(mpi_rank == 0)
-  {
-    for (int i = 1; i < mpi_world_size; i++)
+    int tileCol = toff + localCol;
+    int tileRow = toff + localRow;
+    // 쉐어드 메모리 올리기
+    for (int i = 0; i < WORK; i++)
     {
-      MPI_Irecv(&C[i * node_M * N], node_M * N, MPI_FLOAT, i, 0, MPI_COMM_WORLD, &req[reqNum++]);
-    } 
-  } else {
-    MPI_Isend(C, node_M * N, MPI_FLOAT, 0, 0, MPI_COMM_WORLD, &gar[0]);
-    MPI_Request_free(&gar[0]);
-  }
-}
-
-void matmul(const float *A, const float *B, float *C, int M, int N, int K) 
-{
-  reqNum = 0;
-
-  // SEND B
-  if(mpi_rank == 0)
-  {
-    for (int i = 1; i < mpi_world_size; i++)
-    {
-      MPI_Isend(B, K * N, MPI_FLOAT, i, 0, MPI_COMM_WORLD, &gar[i - 1]);
-      MPI_Request_free(&gar[i - 1]);
-
+      Alocal[localRow + i * WTS][localCol / WORK] = A[((A_globalRow + i * WTS) * K + tileCol) / WORK];
+      Blocal[localRow + i * WTS][localCol / WORK] = B[((tileRow + i * WTS) * N + B_globalCol) / WORK];
     }
-  } else
-  {
-    MPI_Irecv((float *)B, K * N, MPI_FLOAT, 0, 0, MPI_COMM_WORLD, &reqB);
-  }
-
-  // SEND A
-  for (int buf = 0; buf < SLICE; buf++)
-  {
-    int offset = buf * M / SLICE;
-
-    if (mpi_rank == 0)
+    __syncthreads();
+    // 열로는 백터타입, 행으로는 granulality 올리기
+    float4 vector_A, vector_B;
+    float val_A;
+    for (int k = 0; k < TS / WORK; k++)
     {
-      for (int i = 1; i < mpi_world_size; i++)
+      for (int i = 0; i < WORK; i++)
       {
-        MPI_Isend(&A[offset * K + i * node_M * K], node_M * K, MPI_FLOAT, i, 0, MPI_COMM_WORLD, &gar[i-1]);
-        MPI_Request_free(&gar[i-1]);
-
+        vector_A = Alocal[localRow + i * WTS][k];
+        for (int w = 0; w < WORK; w++)
+        {
+          vector_B = Blocal[WORK * k + w][localCol / WORK];
+          switch (w)
+          {
+          case 0: val_A = vector_A.x; break;
+          case 1: val_A = vector_A.y; break;
+          case 2: val_A = vector_A.z; break;
+          case 3: val_A = vector_A.w; break;
+          }
+          acc[i].x += vector_B.x * val_A;
+          acc[i].y += vector_B.y * val_A;
+          acc[i].z += vector_B.z * val_A;
+          acc[i].w += vector_B.w * val_A;
+        }
       }
-    } else
-    {
-      MPI_Irecv((float *)&A[offset * K], node_M * K, MPI_FLOAT, 0, 0, MPI_COMM_WORLD, &reqA[buf]);
     }
+    __syncthreads();
   }
-
-    // node B to gpu_B
-  if (mpi_rank != 0)
+  //최종 C에 더하기
+  for (int i = 0; i < WORK; i++)
   {
-    MPI_Wait(&reqB, MPI_STATUS_IGNORE);
+    C[((A_globalRow + i * WTS) * N + B_globalCol) / WORK] = acc[i];
   }
+}
 
+//GPU 변수 설정
+static float *gpu_A[NGPU], *gpu_B[NGPU], *gpu_C[NGPU];
+static cudaStream_t up[NGPU], calc0[NGPU], calc1[NGPU], down[NGPU];
+static cudaEvent_t event0[NGPU], event1[NGPU], event2[NGPU];
+
+void matmul_initialize(int M, int N, int K)
+{
+  for (int i = 0; i < NGPU; i++)
+  {    
+    CHECK_CUDA(cudaSetDevice(i));    
+    // stream 설정
+    CHECK_CUDA(cudaStreamCreate(&up[i]));
+    CHECK_CUDA(cudaStreamCreate(&calc0[i]));
+    CHECK_CUDA(cudaStreamCreate(&calc1[i]));
+    CHECK_CUDA(cudaStreamCreate(&down[i]));
+    // event 설정
+    CHECK_CUDA(cudaEventCreate(&event0[i]));
+    CHECK_CUDA(cudaEventCreate(&event1[i]));
+    CHECK_CUDA(cudaEventCreate(&event2[i]));
+    // 각 gpu당 matrix memory 할당
+    int gpu_M = M / NGPU;
+    CHECK_CUDA(cudaMalloc(&gpu_A[i], gpu_M * K * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&gpu_B[i], K * N * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&gpu_C[i], gpu_M * N * sizeof(float)));
+  }
+}
+
+void matmul_slice(const float *A, float *C, int M, int N, int K, int buffer)
+{
+  for (int i = 0; i < NGPU; i++)
+  { // GPU당 슬라이스 나누기
+    CHECK_CUDA(cudaSetDevice(i));
+    int Mslice = M / NGPU;
+    int Mbegin = Mslice * i;
+    // 각 GPU에 A슬라이스 올리기
+    CHECK_CUDA(cudaMemcpyAsync(gpu_A[i] + (Mslice * K) * buffer, A + Mbegin * K, Mslice * K * sizeof(float), cudaMemcpyHostToDevice, up[i]));
+    CHECK_CUDA(cudaEventRecord(event0[i], up[i]));
+    // 각 A슬라이스 스트림 기다리기
+    CHECK_CUDA(cudaStreamWaitEvent(calc0[i], event0[i]));
+    CHECK_CUDA(cudaStreamWaitEvent(calc1[i], event0[i]));
+    // 각 kernel 두개로 또 나눠서 스트림 연산
+    dim3 blockDim(TS / WORK, TS / WORK);
+    dim3 gridDim((N + TS - 1) / TS, (Mslice / 2 + TS - 1) / TS);
+    matmul_kernel<<<gridDim, blockDim, 0, calc0[i]>>>((float4 *)(gpu_A[i] + (Mslice * K) * buffer), (float4 *)gpu_B[i], (float4 *)(gpu_C[i] + (Mslice * N) * buffer), Mslice / 2, N, K);
+    matmul_kernel<<<gridDim, blockDim, 0, calc1[i]>>>((float4 *)(gpu_A[i] + (Mslice * K) * buffer + (Mslice / 2 * K)), (float4 *)gpu_B[i], (float4 *)(gpu_C[i] + (Mslice * N) * buffer + (Mslice / 2 * N)), Mslice / 2, N, K);
+    CHECK_CUDA(cudaEventRecord(event1[i], calc0[i]));
+    CHECK_CUDA(cudaEventRecord(event2[i], calc1[i]));
+    // 커널 연산 스트림 기다리기
+    CHECK_CUDA(cudaStreamWaitEvent(down[i], event1[i]));
+    CHECK_CUDA(cudaStreamWaitEvent(down[i], event2[i]));
+    // C를 Host로 보내기
+    CHECK_CUDA(cudaMemcpyAsync(C + Mbegin * N, gpu_C[i] + (Mslice * N) * buffer, Mslice * N * sizeof(float), cudaMemcpyDeviceToHost, down[i]));
+  }
+}
+
+void matmul(const float *A, const float *B, float *C, int M, int N, int K)
+{
+  // B 모든 GPU에 보내 놓기
   for (int i = 0; i < NGPU; i++)
   {
     CHECK_CUDA(cudaSetDevice(i));
-    CHECK_CUDA(cudaMemcpyAsync(B_gpu[i], B, K * N * sizeof(float), cudaMemcpyHostToDevice, streams[i]));
+    CHECK_CUDA(cudaMemcpyAsync(gpu_B[i], B, K * N * sizeof(float), cudaMemcpyHostToDevice, up[i]));
   }
-
-  for (int buf =0; buf < SLICE; buf++)
+  // A를 여러개로 쪼개서 GPU로 연산하기 위한 SLICE 작업 실시
+  for (int buffer = 0; buffer < SLICE; buffer++)
   {
-    int offset = buf * M / SLICE;
-    matmul_slice((float *)&A[offset * K], &C[offset * N], M / SLICE, N, K, buf);
+    int offset = buffer * M / SLICE;
+    matmul_slice(A + offset * K, C + offset * N, M / SLICE, N, K, buffer);
   }
-
-  MPI_Waitall(reqNum, req, MPI_STATUS_IGNORE);
-
-}
-
-void matmul_finalize() 
-{
-  for(size_t i = 0; i < NGPU; i++)
+  // 마지막 싱크 맞추기
+  for (int i = 0; i < NGPU; i++)
   {
     CHECK_CUDA(cudaSetDevice(i));
-    CHECK_CUDA(cudaFree(A_gpu[i]));
-    CHECK_CUDA(cudaFree(B_gpu[i]));
-    CHECK_CUDA(cudaFree(C_gpu[i]));
-    CHECK_CUDA(cudaStreamDestroy(streams[i]));
+    CHECK_CUDA(cudaStreamSynchronize(up[i]));
+    CHECK_CUDA(cudaStreamSynchronize(calc0[i]));
+    CHECK_CUDA(cudaStreamSynchronize(calc1[i]));
+    CHECK_CUDA(cudaStreamSynchronize(down[i]));
+  }
+}
+
+void matmul_finalize()
+{
+  for (int i = 0; i < NGPU; i++)
+  {
+    // 스트림 파괴
+    CHECK_CUDA(cudaSetDevice(i));
+    CHECK_CUDA(cudaStreamDestroy(up[i]));
+    CHECK_CUDA(cudaStreamDestroy(calc0[i]));
+    CHECK_CUDA(cudaStreamDestroy(calc1[i]));
+    CHECK_CUDA(cudaStreamDestroy(down[i]));
+    // 이벤트 파괴
+    CHECK_CUDA(cudaEventDestroy(event0[i]));
+    CHECK_CUDA(cudaEventDestroy(event1[i]));
+    CHECK_CUDA(cudaEventDestroy(event2[i]));
+    // 메모리 프리작업
+    CHECK_CUDA(cudaFree(gpu_A[i]));
+    CHECK_CUDA(cudaFree(gpu_B[i]));
+    CHECK_CUDA(cudaFree(gpu_C[i]));
   }
 }

@@ -128,6 +128,8 @@ int main(int argc, char **argv) {
     if (mpi_rank == 0) {
       printf("[rank %d] Calculating...(iter=%d) ", mpi_rank, i);
       fflush(stdout);
+      rand_mat(A, M, K);
+      rand_mat(B, K, N);
       zero_mat(C, M, N);
     } else {
       zero_mat(A, M, K);
